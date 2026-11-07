@@ -1,0 +1,43 @@
+name: Build RAT_BUILDER.exe
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
+
+      - name: Install GUI deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build GUI
+        run: pyinstaller --clean --noconfirm builder.spec
+
+      - name: Verify artifact
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist/RAT_BUILDER.exe")) {
+            Write-Error "RAT_BUILDER.exe not produced"
+            exit 1
+          }
+          Get-Item "dist/RAT_BUILDER.exe" | Format-List Name, Length
+
+      - name: Upload EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: RAT_BUILDER
+          path: dist/RAT_BUILDER.exe
+          if-no-files-found: error
