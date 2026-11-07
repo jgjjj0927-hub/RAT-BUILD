@@ -1,0 +1,2 @@
+tasklist | findstr loader
+tasklist | findstr rundll32
