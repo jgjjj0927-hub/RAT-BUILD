@@ -1,0 +1,12 @@
+pytelegrambotapi>=4.14.0
+psutil>=5.9.0
+opencv-python-headless>=4.8.0
+sounddevice>=0.4.6
+soundfile>=0.12.1
+Pillow>=10.0.0
+pyautogui>=0.9.54
+pyperclip>=1.8.2
+requests>=2.31.0
+pywin32>=306
+pycryptodome>=3.19.0
+mss>=9.0.1
